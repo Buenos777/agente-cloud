@@ -42,7 +42,7 @@ ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo")  # "demo" ou "real"
 ACCOUNT_ID_OVERRIDE = os.getenv("DERIV_ACCOUNT_ID", "")  # Se vazio, descobre automático
 
 # Webhook do Discord (Notificações de Entrada, WIN/LOSS e Placar)
-DEFAULT_DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1571546035367706624/yoivhP-A_qF-U6SbJMDoeLg0B_04VZZOCOCI5VcWbGpiyWZOi7-hGabX9iVZZyECM9AP"
+DEFAULT_DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1573074553406619678/YA6sVZuw1aCbGPQgA29Klx_Z-_HwqGyJ6OLpt63ZuvnqPQS8JeI0TA360ekzwx4trxQL"
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", DEFAULT_DISCORD_WEBHOOK)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
