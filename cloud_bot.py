@@ -1,33 +1,28 @@
 """
-Agente IA Cloud — Institutional Trend Pullback (Deriv API)
-==========================================================
-Versão cloud do deriv_live_runner.py. Mesma estratégia, mesmas regras,
-zero dependência de MT5. Roda 24/7 em Render/Koyeb/Railway.
+Agente Trader Cloud — Institutional Trend Pullback (Deriv API)
+Execução 24/7 sem dependência de MT5, Windows ou máquina física.
 
-Estratégia:
-  - EMA 9/21/50 (shifted 1 bar) sobre candles M5
-  - RSI 14 (shifted 1 bar) zona 40-60
-  - Pullback Institucional: preço toca EMA 21 e fecha além da EMA 9
-  - ATR 14 para TP (1.8×) e SL (1.0×)
-  - Trava de Sábado: zero operações no weekday 5
-  - Cooldown de 30 min por ativo
-  - Máximo 1 posição aberta na cesta
-
-Ativos: R_100 (Vol100), R_25 (Vol25), R_10 (Vol10)
+Estratégia institucional original:
+  - Cesta: Volatility 100 (R_100), Volatility 25 (R_25), Volatility 10 (R_10)
+  - Timeframe: M5 (300s)
+  - Indicadores: EMA 9, EMA 21, EMA 50, RSI 14, ATR 14
+  - Gatilho: Pullback na EMA 21 com alinhamento de médias e RSI 40-60
+  - Trava de Sábado: suspende operações no sábado (weekday 5)
+  - Cooldown: 30 minutos por ativo
+  - Max posições simultâneas: 1 (em toda a cesta)
 """
 
 import asyncio
 import json
+import logging
 import os
 import sys
-import logging
-import math
 import time
-from datetime import datetime, timezone, timedelta
-from collections import deque
+import urllib.request
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging estruturado
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -38,21 +33,14 @@ logging.basicConfig(
 log = logging.getLogger("cloud_bot")
 
 # ---------------------------------------------------------------------------
-# Configuração (env vars para deploy seguro)
+# Configuração (env vars com fallback seguro)
 # ---------------------------------------------------------------------------
-API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
-APP_ID = os.getenv("DERIV_APP_ID", "1089")
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+API_TOKEN = os.getenv("DERIV_API_TOKEN", "pat_f9c4151cc0d0206ee114bd367bdb56665b84b6a679c73c818c9403fb6813fece")
+APP_ID = os.getenv("DERIV_APP_ID", "34aYJ2dEbNZrIqKNOZPrY")
+ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo")  # "demo" ou "real"
+ACCOUNT_ID_OVERRIDE = os.getenv("DERIV_ACCOUNT_ID", "")  # Se vazio, descobre automático
 
-# Fallback endpoints caso o primário falhe
-WS_ENDPOINTS = [
-    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
-    f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}",
-    f"wss://green.binaryws.com/websockets/v3?app_id={APP_ID}",
-    f"wss://blue.binaryws.com/websockets/v3?app_id={APP_ID}",
-]
-
-# Webhook de alertas (Discord ou Telegram — configurar depois)
+# Webhook de alertas (Discord ou Telegram)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -96,9 +84,10 @@ MAX_OPEN_POSITIONS = 1
 last_trade_time: dict[str, float] = {sym: 0 for sym in BASKET}
 last_evaluated_epoch: dict[str, int] = {sym: 0 for sym in BASKET}
 open_positions: list[dict] = []
-authorized = False
 account_balance = 0.0
 account_currency = "USD"
+active_account_id = ""
+active_account_type = ""
 
 # ---------------------------------------------------------------------------
 # Indicadores — idênticos ao deriv_live_runner.py
@@ -139,7 +128,7 @@ def calculate_indicators(candles: list[dict]) -> dict | None:
         lc = abs(lows[i] - closes[i - 1])
         tr_list.append(max(hl, hc, lc))
 
-    # ATR = SMA(14) do TR, shifted 1 → usamos valores até n-2
+    # ATR = SMA(14) do TR, shifted 1 -> usamos valores até n-2
     atr_vals = []
     for i in range(len(tr_list)):
         if i < 13:
@@ -147,132 +136,211 @@ def calculate_indicators(candles: list[dict]) -> dict | None:
         else:
             atr_vals.append(sum(tr_list[i - 13 : i + 1]) / 14)
 
-    # shifted 1: ATR da barra fechada = atr_vals[-2] (penúltimo TR index)
     if atr_vals[-2] is None:
         return None
     atr = atr_vals[-2]
 
-    # ---------- EMA 9/21/50 (shifted 1 — calculado sobre closes shifted 1) ----------
-    # shifted 1 = ewm sobre closes[:-1] e pegar último valor
-    closes_shifted = closes[:-1]  # exclui barra formando
-    ema_9_all = ema(closes_shifted, 9)
-    ema_21_all = ema(closes_shifted, 21)
-    ema_50_all = ema(closes_shifted, 50)
+    # ---------- EMAs (9, 21, 50) com ewm(span=N) ----------
+    ema9_all = ema(closes, 9)
+    ema21_all = ema(closes, 21)
+    ema50_all = ema(closes, 50)
 
-    ema_9 = ema_9_all[-1]
-    ema_21 = ema_21_all[-1]
-    ema_50 = ema_50_all[-1]
+    # Valores da barra fechada (índice n - 2)
+    ema_9 = ema9_all[-2]
+    ema_21 = ema21_all[-2]
+    ema_50 = ema50_all[-2]
 
-    # ---------- RSI 14 (shifted 1) ----------
+    # ---------- RSI 14 ----------
     deltas = [closes[i] - closes[i - 1] for i in range(1, n)]
-    # shifted 1 → usar deltas até -2 (excluir a barra formando)
-    deltas_shifted = deltas[:-1]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
 
-    gains = [max(d, 0) for d in deltas_shifted]
-    losses = [max(-d, 0) for d in deltas_shifted]
+    # ewm(alpha=1/14) para RSI
+    alpha_rsi = 1.0 / 14.0
 
-    # SMA de 14 períodos (rolling) → pegar último
-    if len(gains) < 14:
-        return None
-    avg_gain = sum(gains[-14:]) / 14
-    avg_loss = sum(losses[-14:]) / 14
+    def ewm_rsi(vals: list[float]) -> list[float]:
+        res = [vals[0]]
+        for i in range(1, len(vals)):
+            res.append(alpha_rsi * vals[i] + (1 - alpha_rsi) * res[-1])
+        return res
 
-    if avg_loss < 1e-8:
+    avg_gain = ewm_rsi(gains)
+    avg_loss = ewm_rsi(losses)
+
+    # shifted 1: índice correspondente à barra fechada em deltas é n - 3
+    ag = avg_gain[-2]
+    al = avg_loss[-2]
+    if al == 0:
         rsi = 100.0
     else:
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
+        rs = ag / al
+        rsi = 100.0 - (100.0 / (1.0 + rs))
 
-    # Barra fechada = candles[-2], barra formando = candles[-1]
-    closed = candles[-2]
     return {
-        "closed_epoch": closed["epoch"],
-        "atr": atr,
         "ema_9": ema_9,
         "ema_21": ema_21,
         "ema_50": ema_50,
         "rsi": rsi,
-        "close_prev": closed["close"],
-        "open_prev": closed["open"],
-        "high_prev": closed["high"],
-        "low_prev": closed["low"],
+        "atr": atr,
+        "close_prev": closes[-2],
+        "open_prev": opens[-2],
+        "high_prev": highs[-2],
+        "low_prev": lows[-2],
     }
 
 
 # ---------------------------------------------------------------------------
-# Alertas (Discord / Telegram)
+# Notificações (Discord / Telegram)
 # ---------------------------------------------------------------------------
 
 async def send_alert(message: str):
-    """Envia alerta para Discord webhook ou Telegram (não-bloqueante)."""
-    log.info(f"[ALERTA] {message}")
-    try:
-        import aiohttp
+    """Envia alerta para Discord ou Telegram (se configurados)."""
+    log.info(f"[ALERTA] {message.replace(chr(10), ' | ')}")
 
-        if DISCORD_WEBHOOK:
+    if DISCORD_WEBHOOK:
+        try:
+            import aiohttp
             async with aiohttp.ClientSession() as session:
                 await session.post(
                     DISCORD_WEBHOOK,
-                    json={"content": message},
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    json={"content": f"🤖 **Agente Cloud:**\n{message}"},
+                    timeout=aiohttp.ClientTimeout(total=5),
                 )
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        except Exception as e:
+            log.warning(f"Falha webhook Discord: {e}")
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            import aiohttp
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             async with aiohttp.ClientSession() as session:
                 await session.post(
                     url,
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🤖 Agente Cloud:\n{message}"},
+                    timeout=aiohttp.ClientTimeout(total=5),
                 )
-    except Exception as e:
-        log.warning(f"[ALERTA FALHOU] {e}")
+        except Exception as e:
+            log.warning(f"Falha webhook Telegram: {e}")
 
 
 # ---------------------------------------------------------------------------
-# WebSocket — comunicação com a Deriv
+# Descoberta de Contas e Gerador de OTP (Nova Deriv API)
+# ---------------------------------------------------------------------------
+
+def fetch_deriv_otp_url() -> tuple[str, str, str, float, str]:
+    """
+    Chama os endpoints REST oficiais da nova Deriv API:
+    1. GET /trading/v1/options/accounts (identifica conta demo/real)
+    2. POST /trading/v1/options/accounts/{id}/otp (gera WebSocket URL autenticada)
+    """
+    global active_account_id, active_account_type, account_balance, account_currency
+
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Deriv-App-ID": APP_ID,
+        "User-Agent": "Mozilla/5.0",
+        "Content-Type": "application/json",
+    }
+
+    # 1. Buscar lista de contas
+    req_acc = urllib.request.Request(
+        "https://api.derivws.com/trading/v1/options/accounts",
+        headers=headers,
+    )
+    with urllib.request.urlopen(req_acc, timeout=15) as resp:
+        acc_data = json.loads(resp.read().decode())
+        accounts = acc_data.get("data", [])
+
+    if not accounts:
+        raise RuntimeError("Nenhuma conta retornada pela Deriv API.")
+
+    # Filtrar conta por ID explícito ou por tipo (demo / real)
+    target = None
+    if ACCOUNT_ID_OVERRIDE:
+        for acc in accounts:
+            if acc.get("account_id") == ACCOUNT_ID_OVERRIDE:
+                target = acc
+                break
+    if not target:
+        for acc in accounts:
+            if acc.get("account_type") == ACCOUNT_TYPE:
+                target = acc
+                break
+    if not target:
+        target = accounts[0]
+
+    acc_id = target.get("account_id")
+    acc_type = target.get("account_type", "demo")
+    bal = float(target.get("balance", 0.0))
+    curr = target.get("currency", "USD")
+
+    active_account_id = acc_id
+    active_account_type = acc_type
+    account_balance = bal
+    account_currency = curr
+
+    log.info(
+        f"Conta Deriv selecionada: {acc_id} ({acc_type.upper()}) | "
+        f"Saldo: ${bal:.2f} {curr}"
+    )
+
+    # 2. Gerar OTP para o WebSocket
+    otp_req = urllib.request.Request(
+        f"https://api.derivws.com/trading/v1/options/accounts/{acc_id}/otp",
+        data=b"{}",
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(otp_req, timeout=15) as resp:
+        otp_res = json.loads(resp.read().decode())
+        ws_url = otp_res.get("data", {}).get("url")
+        if not ws_url:
+            raise RuntimeError(f"OTP não retornou URL: {otp_res}")
+
+    return ws_url, acc_id, acc_type, bal, curr
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — comunicação em tempo real com a Deriv
 # ---------------------------------------------------------------------------
 
 class DerivWS:
-    """Wrapper para a conexão WebSocket com a Deriv API."""
+    """Wrapper para a conexão WebSocket autenticada via OTP da Deriv."""
 
     def __init__(self):
         self.ws = None
         self._req_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._recv_task: asyncio.Task | None = None
-        self._endpoint_idx = 0
+        self.account_id = ""
+        self.account_type = ""
 
     def _next_id(self) -> int:
         self._req_id += 1
         return self._req_id
 
     async def connect(self):
-        """Tenta conectar em cada endpoint até conseguir."""
+        """Obtém URL OTP da nova Deriv API e conecta."""
         import websockets
 
-        for attempt in range(len(WS_ENDPOINTS) * 2):
-            idx = attempt % len(WS_ENDPOINTS)
-            url = WS_ENDPOINTS[idx]
-            try:
-                log.info(f"Conectando a {url} ...")
-                self.ws = await asyncio.wait_for(
-                    websockets.connect(
-                        url,
-                        ping_interval=25,
-                        ping_timeout=10,
-                        close_timeout=5,
-                        max_size=2**22,
-                    ),
-                    timeout=15,
-                )
-                log.info("WebSocket conectado!")
-                self._recv_task = asyncio.create_task(self._recv_loop())
-                return
-            except Exception as e:
-                log.warning(f"Falha em {url}: {e}")
-                await asyncio.sleep(2)
+        log.info("Obtendo URL autenticada da Deriv via OTP REST API...")
+        ws_url, acc_id, acc_type, bal, curr = await asyncio.to_thread(fetch_deriv_otp_url)
+        self.account_id = acc_id
+        self.account_type = acc_type
 
-        raise ConnectionError("Não foi possível conectar a nenhum endpoint da Deriv.")
+        log.info(f"Conectando ao WebSocket da Deriv ({acc_type})...")
+        self.ws = await asyncio.wait_for(
+            websockets.connect(
+                ws_url,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5,
+                max_size=2**22,
+            ),
+            timeout=15,
+        )
+        log.info(f"WebSocket conectado com sucesso! [Conta {acc_id}]")
+        self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def close(self):
         if self._recv_task:
@@ -292,7 +360,6 @@ class DerivWS:
                         fut.set_result(data)
         except Exception as e:
             log.error(f"recv_loop encerrado: {e}")
-            # Resolver todos os futures pendentes com erro
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(ConnectionError(str(e)))
@@ -311,12 +378,9 @@ class DerivWS:
             self._pending.pop(req_id, None)
             raise
 
-    async def authorize(self) -> dict:
-        """Envia token de autorização."""
-        resp = await self.send({"authorize": API_TOKEN})
-        if "error" in resp:
-            raise RuntimeError(f"Auth falhou: {resp['error']}")
-        return resp
+    async def get_balance(self) -> dict:
+        """Consulta saldo atualizado."""
+        return await self.send({"balance": 1})
 
     async def get_candles(self, symbol: str, count: int = HISTORY_COUNT) -> list[dict]:
         """Busca candles M5 históricos."""
@@ -350,58 +414,62 @@ class DerivWS:
     async def buy_contract(
         self, symbol: str, contract_type: str, amount: float, duration: int = 5, duration_unit: str = "m"
     ) -> dict:
-        """Compra contrato (CALL ou PUT) na Deriv."""
-        resp = await self.send(
-            {
-                "buy": 1,
-                "price": amount,
-                "parameters": {
-                    "contract_type": contract_type,  # "CALL" ou "PUT"
-                    "symbol": symbol,
-                    "basis": "stake",
-                    "amount": amount,
-                    "duration": duration,
-                    "duration_unit": duration_unit,
-                    "currency": "USD",
-                },
-            },
-            timeout=15,
-        )
-        return resp
+        """
+        Executa compra na nova Deriv API:
+        1. Solicita proposta (proposal) usando underlying_symbol
+        2. Executa a compra do ID gerado
+        """
+        prop_req = {
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "duration": duration,
+            "duration_unit": duration_unit,
+            "underlying_symbol": symbol,
+        }
+        prop_res = await self.send(prop_req, timeout=15)
+        if "error" in prop_res:
+            return prop_res
 
-    async def get_balance(self) -> dict:
-        return await self.send({"balance": 1})
+        prop_id = prop_res.get("proposal", {}).get("id")
+        ask_price = prop_res.get("proposal", {}).get("ask_price", amount)
+
+        buy_res = await self.send({"buy": prop_id, "price": ask_price}, timeout=15)
+        return buy_res
 
     async def get_open_contracts(self) -> dict:
+        """Consulta contratos atualmente abertos na carteira."""
         return await self.send({"portfolio": 1})
 
 
 # ---------------------------------------------------------------------------
-# Loop principal — mesma lógica do deriv_live_runner.py
+# Loop principal de trading
 # ---------------------------------------------------------------------------
 
 async def trading_loop(ws: DerivWS):
-    """Loop idêntico ao main() do deriv_live_runner.py, adaptado para API."""
+    """Loop idêntico ao deriv_live_runner.py, operando 100% em nuvem."""
     global open_positions, account_balance, account_currency
 
     log.info("")
     log.info("=" * 70)
     log.info("   AGENTE IA CLOUD — INSTITUTIONAL TREND PULLBACK (DERIV API)")
+    log.info(f"   Conta: {active_account_id} ({active_account_type.upper()}) | Saldo: ${account_balance:.2f} {account_currency}")
     log.info("   Ativos: R_100 (Vol100), R_25 (Vol25), R_10 (Vol10)")
     log.info("   Regra: Trava de Sábado | Cooldown 30min | Max 1 posição")
-    log.info("   Deploy: Render/Koyeb/Railway — 24/7 sem PC")
+    log.info("   Deploy: Render Cloud — 24/7 sem PC nem MT5")
     log.info("=" * 70)
     log.info("")
 
-    # Buscar saldo inicial
+    # Atualizar saldo inicial
     try:
         bal_resp = await ws.get_balance()
         bal = bal_resp.get("balance", {})
-        account_balance = float(bal.get("balance", 0))
-        account_currency = bal.get("currency", "USD")
-        log.info(f"[CONECTADO] Saldo: ${account_balance:.2f} {account_currency}")
+        account_balance = float(bal.get("balance", account_balance))
+        account_currency = bal.get("currency", account_currency)
     except Exception as e:
-        log.warning(f"Não conseguiu ler saldo: {e}")
+        log.warning(f"Erro ao ler saldo inicial: {e}")
 
     last_heartbeat = 0
     cycle = 0
@@ -413,7 +481,7 @@ async def trading_loop(ws: DerivWS):
             # ---- Trava de Sábado (weekday 5) ----
             if now_utc.weekday() == 5:
                 if (time.time() - last_heartbeat) >= 300:
-                    log.info(f"[SÁBADO] Trava de fim de semana ativa. IA em repouso protetor.")
+                    log.info("[SÁBADO] Trava de fim de semana ativa. IA em repouso protetor.")
                     last_heartbeat = time.time()
                 await asyncio.sleep(30)
                 continue
@@ -426,19 +494,18 @@ async def trading_loop(ws: DerivWS):
                     else "0 (Aguardando gatilho)"
                 )
                 log.info(
-                    f"[STATUS OK] Saldo: ${account_balance:.2f} {account_currency} "
+                    f"[STATUS OK] Conta {active_account_id} | Saldo: ${account_balance:.2f} {account_currency} "
                     f"| Posições: {pos_str} | Ciclo #{cycle}"
                 )
                 last_heartbeat = time.time()
 
-            # ---- Se já tem posição aberta, não abre outra ----
-            # Verificar contratos abertos via API
+            # ---- Verificar posições abertas ----
             try:
                 portfolio = await ws.get_open_contracts()
                 contracts = portfolio.get("portfolio", {}).get("contracts", [])
                 open_positions = [
                     c for c in contracts
-                    if c.get("symbol") in BASKET
+                    if (c.get("underlying_symbol") or c.get("symbol")) in BASKET
                 ]
             except Exception:
                 pass
@@ -497,23 +564,16 @@ async def trading_loop(ws: DerivWS):
                         stype = "PUT"
 
                 if stype is not None:
-                    # Calcular stake e enviar ordem
                     stake = cfg["lot"]
                     tp_dist = cfg["tp_atr"] * atr
                     sl_dist = cfg["sl_atr"] * atr
                     entry_price = ind["close_prev"]
 
-                    log.info(f"")
-                    log.info(f">>> SINAL DETECTADO <<<")
-                    log.info(
-                        f"    Ativo: {cfg['display']} ({sym}) | Tipo: {stype}"
-                    )
-                    log.info(
-                        f"    Preço: {entry_price:.4f} | ATR: {atr:.4f}"
-                    )
-                    log.info(
-                        f"    TP dist: {tp_dist:.4f} | SL dist: {sl_dist:.4f}"
-                    )
+                    log.info("")
+                    log.info(">>> SINAL INSTITUCIONAL DETECTADO <<<")
+                    log.info(f"    Ativo: {cfg['display']} ({sym}) | Tipo: {stype}")
+                    log.info(f"    Preço: {entry_price:.4f} | ATR: {atr:.4f}")
+                    log.info(f"    TP dist: {tp_dist:.4f} | SL dist: {sl_dist:.4f}")
                     log.info(
                         f"    EMA9={ind['ema_9']:.4f} EMA21={ind['ema_21']:.4f} "
                         f"EMA50={ind['ema_50']:.4f} RSI={ind['rsi']:.1f}"
@@ -542,8 +602,8 @@ async def trading_loop(ws: DerivWS):
                             buy_price = buy_info.get("buy_price", stake)
                             payout = buy_info.get("payout", 0)
 
-                            log.info(f"")
-                            log.info(f">>> ORDEM EXECUTADA <<<")
+                            log.info("")
+                            log.info(">>> ORDEM EXECUTADA NA DERIV <<<")
                             log.info(
                                 f"    Contrato: {contract_id} | Stake: ${buy_price} | Payout: ${payout}"
                             )
@@ -551,7 +611,7 @@ async def trading_loop(ws: DerivWS):
                             last_trade_time[sym] = time.time()
 
                             await send_alert(
-                                f"✅ ORDEM EXECUTADA\n"
+                                f"✅ ORDEM EXECUTADA ({active_account_type.upper()})\n"
                                 f"Ativo: {cfg['display']}\n"
                                 f"Tipo: {stype}\n"
                                 f"Stake: ${buy_price}\n"
@@ -559,7 +619,6 @@ async def trading_loop(ws: DerivWS):
                                 f"Contrato: {contract_id}"
                             )
 
-                            # Atualizar saldo
                             try:
                                 bal_resp = await ws.get_balance()
                                 account_balance = float(
@@ -585,7 +644,7 @@ async def trading_loop(ws: DerivWS):
 # Healthcheck HTTP server (para rodar de GRAÇA no Render Web Service)
 # ---------------------------------------------------------------------------
 async def start_healthcheck_server():
-    """Servidor HTTP mínimo na porta 8080 para o Render não derrubar o serviço."""
+    """Servidor HTTP mínimo na porta 8080 para o Render manter o serviço ativo."""
     from aiohttp import web
 
     async def handle_ping(request):
@@ -593,6 +652,8 @@ async def start_healthcheck_server():
         return web.json_response({
             "status": "online",
             "bot": "Agente IA Cloud",
+            "account_id": active_account_id,
+            "account_type": active_account_type,
             "balance": f"${account_balance:.2f} {account_currency}",
             "positions": pos_str,
             "utc_time": datetime.now(timezone.utc).isoformat(),
@@ -601,7 +662,7 @@ async def start_healthcheck_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/healthz", handle_ping)
-    
+
     port = int(os.getenv("PORT", "8080"))
     runner = web.AppRunner(app)
     await runner.setup()
@@ -615,7 +676,6 @@ async def start_healthcheck_server():
 # ---------------------------------------------------------------------------
 
 async def main():
-    # Iniciar servidor HTTP para o plano Free do Render
     try:
         await start_healthcheck_server()
     except Exception as e:
@@ -627,19 +687,7 @@ async def main():
         ws = DerivWS()
         try:
             await ws.connect()
-
-            # Autorizar
-            log.info("Autorizando com token API...")
-            auth = await ws.authorize()
-            auth_data = auth.get("authorize", {})
-            log.info(
-                f"Autorizado! Conta: {auth_data.get('loginid', '?')} | "
-                f"Email: {auth_data.get('email', '?')}"
-            )
-
-            reconnect_delay = 5  # reset delay após sucesso
-
-            # Rodar loop de trading
+            reconnect_delay = 5
             await trading_loop(ws)
 
         except KeyboardInterrupt:
@@ -659,4 +707,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

@@ -8,7 +8,8 @@ services:
       - key: DERIV_API_TOKEN
         sync: false
       - key: DERIV_APP_ID
-        value: "1089"
+        value: "34aYJ2dEbNZrIqKNOZPrY"
+      - key: DERIV_ACCOUNT_TYPE
+        value: "demo"
       - key: PORT
         value: "8080"
-
