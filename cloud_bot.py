@@ -10,6 +10,7 @@ Estratégia institucional original:
   - Trava de Sábado: suspende operações no sábado (weekday 5)
   - Cooldown: 30 minutos por ativo
   - Max posições simultâneas: 1 (em toda a cesta)
+  - Notificações: Discord Rich Embeds com Entrada, Desfecho (WIN/LOSS), Placar e Saldo
 """
 
 import asyncio
@@ -40,8 +41,9 @@ APP_ID = os.getenv("DERIV_APP_ID", "34aYJ2dEbNZrIqKNOZPrY")
 ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo")  # "demo" ou "real"
 ACCOUNT_ID_OVERRIDE = os.getenv("DERIV_ACCOUNT_ID", "")  # Se vazio, descobre automático
 
-# Webhook de alertas (Discord ou Telegram)
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+# Webhook do Discord (Notificações de Entrada, WIN/LOSS e Placar)
+DEFAULT_DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1571546035367706624/yoivhP-A_qF-U6SbJMDoeLg0B_04VZZOCOCI5VcWbGpiyWZOi7-hGabX9iVZZyECM9AP"
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", DEFAULT_DISCORD_WEBHOOK)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -79,7 +81,7 @@ HISTORY_COUNT = 80  # candles necessários para indicadores
 MAX_OPEN_POSITIONS = 1
 
 # ---------------------------------------------------------------------------
-# Estado global
+# Estado global & Estatísticas da Sessão
 # ---------------------------------------------------------------------------
 last_trade_time: dict[str, float] = {sym: 0 for sym in BASKET}
 last_evaluated_epoch: dict[str, int] = {sym: 0 for sym in BASKET}
@@ -88,6 +90,14 @@ account_balance = 0.0
 account_currency = "USD"
 active_account_id = ""
 active_account_type = ""
+
+# Estatísticas para relatório no Discord
+session_stats = {
+    "total": 0,
+    "wins": 0,
+    "losses": 0,
+    "net_profit": 0.0,
+}
 
 # ---------------------------------------------------------------------------
 # Indicadores — idênticos ao deriv_live_runner.py
@@ -190,37 +200,142 @@ def calculate_indicators(candles: list[dict]) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Notificações (Discord / Telegram)
+# Notificações no Discord (Rich Embeds Profissionais)
 # ---------------------------------------------------------------------------
 
-async def send_alert(message: str):
-    """Envia alerta para Discord ou Telegram (se configurados)."""
-    log.info(f"[ALERTA] {message.replace(chr(10), ' | ')}")
+async def send_discord_embed(embed: dict):
+    """Envia um Rich Embed para o Discord de forma assíncrona e segura."""
+    if not DISCORD_WEBHOOK:
+        return
 
-    if DISCORD_WEBHOOK:
+    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+
+    def _post():
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 AgenteTraderCloud/1.0",
+            },
+            method="POST",
+        )
         try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                await session.post(
-                    DISCORD_WEBHOOK,
-                    json={"content": f"🤖 **Agente Cloud:**\n{message}"},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                pass
         except Exception as e:
             log.warning(f"Falha webhook Discord: {e}")
 
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            import aiohttp
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            async with aiohttp.ClientSession() as session:
-                await session.post(
-                    url,
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🤖 Agente Cloud:\n{message}"},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                )
-        except Exception as e:
-            log.warning(f"Falha webhook Telegram: {e}")
+    await asyncio.to_thread(_post)
+
+
+async def send_discord_entry_alert(
+    contract_id: int,
+    display: str,
+    symbol: str,
+    stype: str,
+    stake: float,
+    payout: float,
+    entry_price: float,
+    ind: dict,
+    balance: float,
+    currency: str,
+):
+    """Notificação completa enviada no momento exato em que a ordem é executada."""
+    is_call = (stype == "CALL")
+    direction_str = "🟢 CALL (COMPRA / ALTA)" if is_call else "🔴 PUT (VENDA / BAIXA)"
+    color = 0x2E86DE if is_call else 0xE74C3C
+
+    embed = {
+        "title": f"⚡ [NOVA ENTRADA] {display} — {stype}",
+        "description": "O Agente IA identificou um alinhamento institucional perfeito e executou uma nova ordem na Deriv.",
+        "color": color,
+        "fields": [
+            {"name": "Ativo", "value": f"**{display}** (`{symbol}`)", "inline": True},
+            {"name": "Direção", "value": direction_str, "inline": True},
+            {"name": "Duração", "value": "⏱️ **5 Minutos (M5)**", "inline": True},
+            {"name": "Valor da Entrada (Stake)", "value": f"💵 **${stake:.2f} {currency}**", "inline": True},
+            {"name": "Retorno Potencial (Payout)", "value": f"🎯 **${payout:.2f} {currency}**", "inline": True},
+            {"name": "Preço de Entrada (Spot)", "value": f"📊 `{entry_price:.4f}`", "inline": True},
+            {
+                "name": "🧠 Gatilho Técnico Institucional",
+                "value": (
+                    f"• Médias: EMA 9 (`{ind['ema_9']:.2f}`) | EMA 21 (`{ind['ema_21']:.2f}`) | EMA 50 (`{ind['ema_50']:.2f}`)\n"
+                    f"• RSI (14): `{ind['rsi']:.1f}` (faixa 40–60 confirmada)\n"
+                    f"• Volatilidade ATR: `{ind['atr']:.4f}`\n"
+                    f"• Padrão: Pullback comprovado na EMA 21 com fluxo a favor da tendência"
+                ),
+                "inline": False,
+            },
+            {"name": "ID do Contrato", "value": f"`#{contract_id}`", "inline": True},
+            {"name": "Saldo Atual da Banca", "value": f"🏦 **${balance:.2f} {currency}**", "inline": True},
+            {"name": "Conta Deriv", "value": f"`{active_account_id}` ({active_account_type.upper()})", "inline": True},
+        ],
+        "footer": {"text": "Agente Trader Cloud • Deriv API • 24/7 Autônomo"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    await send_discord_embed(embed)
+
+
+async def send_discord_outcome_alert(
+    contract_id: int,
+    display: str,
+    symbol: str,
+    stype: str,
+    stake: float,
+    is_win: bool,
+    profit: float,
+    profit_pct: float,
+    entry_price: float,
+    exit_price: float,
+    session_stats: dict,
+    balance: float,
+    currency: str,
+):
+    """Notificação sequencial enviada assim que a vela M5 fecha, com WIN/LOSS, estatísticas e saldo."""
+    total = session_stats["total"]
+    wins = session_stats["wins"]
+    losses = session_stats["losses"]
+    net_profit = session_stats["net_profit"]
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+
+    if is_win:
+        title = f"🎯 [RESULTADO: WIN] {display} — Vitória Confirmada! 🎉"
+        color = 0x00FF88  # Verde Neon
+        result_badge = "✅ **VITÓRIA (WIN)**"
+        profit_badge = f"💰 **+${profit:.2f} {currency} (+{profit_pct:.1f}%)**"
+        desc = "A projeção institucional foi confirmada com sucesso no fechamento da vela M5!"
+    else:
+        title = f"🛑 [RESULTADO: LOSS] {display} — Operação Encerrada"
+        color = 0xFF3838  # Vermelho
+        result_badge = "❌ **DERROTA (LOSS)**"
+        profit_badge = f"🔻 **-${abs(profit):.2f} {currency} (-100%)**"
+        desc = "O mercado retraiu contra a posição no fechamento da vela M5."
+
+    embed = {
+        "title": title,
+        "description": desc,
+        "color": color,
+        "fields": [
+            {"name": "Resultado", "value": result_badge, "inline": True},
+            {"name": "Lucro / Prejuízo", "value": profit_badge, "inline": True},
+            {"name": "Entrada ➔ Saída", "value": f"`{entry_price:.4f}` ➔ `{exit_price:.4f}`", "inline": True},
+            {"name": "🏆 Placar da Sessão", "value": f"**{wins} Wins — {losses} Losses**", "inline": True},
+            {"name": "📊 Assertividade (Winrate)", "value": f"**{winrate:.1f}%**", "inline": True},
+            {"name": "📈 Lucro Líquido Acumulado", "value": f"**${net_profit:+.2f} {currency}**", "inline": True},
+            {"name": "💳 Saldo Atual da Banca", "value": f"🏦 **${balance:.2f} {currency}**", "inline": True},
+            {"name": "Ativo / Direção", "value": f"{display} ({stype})", "inline": True},
+            {"name": "Contrato", "value": f"`#{contract_id}`", "inline": True},
+            {
+                "name": "⏳ Gestão de Risco e Próximo Passo",
+                "value": f"• Cooldown protetor de 30 minutos ativado em **{display}**.\n• IA continua varrendo a cesta em busca de novas oportunidades alinhadas.",
+                "inline": False,
+            },
+        ],
+        "footer": {"text": "Agente Trader Cloud • Deriv API • 24/7 Autônomo"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    await send_discord_embed(embed)
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +558,96 @@ class DerivWS:
         """Consulta contratos atualmente abertos na carteira."""
         return await self.send({"portfolio": 1})
 
+    async def get_contract_status(self, contract_id: int) -> dict:
+        """Consulta detalhes e status de um contrato específico (aberto ou finalizado)."""
+        return await self.send({"proposal_open_contract": 1, "contract_id": contract_id}, timeout=15)
+
+
+# ---------------------------------------------------------------------------
+# Monitoramento do Desfecho (WIN/LOSS) em Segundo Plano
+# ---------------------------------------------------------------------------
+
+async def monitor_contract_outcome(
+    ws: DerivWS,
+    contract_id: int,
+    symbol: str,
+    display: str,
+    stype: str,
+    stake: float,
+    payout: float,
+    entry_price: float,
+    duration_min: int = 5,
+):
+    """
+    Acompanha o contrato até a expiração na Deriv.
+    Assim que finaliza (status != 'open' ou is_expired == 1),
+    calcula Win/Loss, estatísticas acumuladas e envia notificação rica no Discord.
+    """
+    global session_stats, account_balance, account_currency
+
+    log.info(f"Monitorando contrato #{contract_id} ({display} {stype}) - {duration_min}m...")
+    # Aguarda até perto do encerramento (ex: 260s para contrato de 300s) antes de consultar
+    wait_initial = max(5, (duration_min * 60) - 40)
+    await asyncio.sleep(wait_initial)
+
+    for attempt in range(40):  # tenta por até ~3 minutos após o término previsto
+        try:
+            resp = await ws.get_contract_status(contract_id)
+            poc = resp.get("proposal_open_contract", {})
+            status = poc.get("status", "open")
+            is_expired = poc.get("is_expired", 0)
+
+            if is_expired == 1 or status in ("won", "lost"):
+                is_win = (status == "won")
+                profit = float(poc.get("profit", (payout - stake) if is_win else -stake))
+                exit_price = float(poc.get("exit_spot", entry_price))
+                profit_pct = float(poc.get("profit_percentage", 0.0))
+
+                session_stats["total"] += 1
+                if is_win:
+                    session_stats["wins"] += 1
+                else:
+                    session_stats["losses"] += 1
+                session_stats["net_profit"] += profit
+
+                # Atualizar saldo da conta
+                try:
+                    bal_resp = await ws.get_balance()
+                    bal = bal_resp.get("balance", {})
+                    account_balance = float(bal.get("balance", account_balance))
+                    account_currency = bal.get("currency", account_currency)
+                except Exception:
+                    pass
+
+                log.info(
+                    f">>> [DESFECHO DO CONTRATO #{contract_id}] "
+                    f"{'WIN' if is_win else 'LOSS'} | Lucro: ${profit:+.2f} | "
+                    f"Placar: {session_stats['wins']}W - {session_stats['losses']}L | "
+                    f"Saldo: ${account_balance:.2f} {account_currency}"
+                )
+
+                await send_discord_outcome_alert(
+                    contract_id=contract_id,
+                    display=display,
+                    symbol=symbol,
+                    stype=stype,
+                    stake=stake,
+                    is_win=is_win,
+                    profit=profit,
+                    profit_pct=profit_pct,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    session_stats=session_stats,
+                    balance=account_balance,
+                    currency=account_currency,
+                )
+                return
+
+        except Exception as e:
+            log.warning(f"Erro ao verificar contrato #{contract_id}: {e}")
+
+        await asyncio.sleep(5)
+
 
 # ---------------------------------------------------------------------------
 # Loop principal de trading
@@ -458,6 +663,7 @@ async def trading_loop(ws: DerivWS):
     log.info(f"   Conta: {active_account_id} ({active_account_type.upper()}) | Saldo: ${account_balance:.2f} {account_currency}")
     log.info("   Ativos: R_100 (Vol100), R_25 (Vol25), R_10 (Vol10)")
     log.info("   Regra: Trava de Sábado | Cooldown 30min | Max 1 posição")
+    log.info("   Notificações Discord: Ativas com Entrada e Relatório WIN/LOSS")
     log.info("   Deploy: Render Cloud — 24/7 sem PC nem MT5")
     log.info("=" * 70)
     log.info("")
@@ -495,7 +701,7 @@ async def trading_loop(ws: DerivWS):
                 )
                 log.info(
                     f"[STATUS OK] Conta {active_account_id} | Saldo: ${account_balance:.2f} {account_currency} "
-                    f"| Posições: {pos_str} | Ciclo #{cycle}"
+                    f"| Placar: {session_stats['wins']}W/{session_stats['losses']}L | Posições: {pos_str} | Ciclo #{cycle}"
                 )
                 last_heartbeat = time.time()
 
@@ -592,31 +798,47 @@ async def trading_loop(ws: DerivWS):
                             log.error(
                                 f"[ORDEM FALHOU] {result['error'].get('message', result['error'])}"
                             )
-                            await send_alert(
-                                f"❌ ORDEM FALHOU {stype} {cfg['display']}: "
-                                f"{result['error'].get('message', '')}"
-                            )
                         else:
                             buy_info = result.get("buy", {})
-                            contract_id = buy_info.get("contract_id", "?")
-                            buy_price = buy_info.get("buy_price", stake)
-                            payout = buy_info.get("payout", 0)
+                            contract_id = int(buy_info.get("contract_id", 0))
+                            buy_price = float(buy_info.get("buy_price", stake))
+                            payout = float(buy_info.get("payout", 0.0))
 
                             log.info("")
                             log.info(">>> ORDEM EXECUTADA NA DERIV <<<")
                             log.info(
-                                f"    Contrato: {contract_id} | Stake: ${buy_price} | Payout: ${payout}"
+                                f"    Contrato: {contract_id} | Stake: ${buy_price:.2f} | Payout: ${payout:.2f}"
                             )
 
                             last_trade_time[sym] = time.time()
 
-                            await send_alert(
-                                f"✅ ORDEM EXECUTADA ({active_account_type.upper()})\n"
-                                f"Ativo: {cfg['display']}\n"
-                                f"Tipo: {stype}\n"
-                                f"Stake: ${buy_price}\n"
-                                f"Payout: ${payout}\n"
-                                f"Contrato: {contract_id}"
+                            # 1. Enviar Alerta Completo de Entrada no Discord
+                            await send_discord_entry_alert(
+                                contract_id=contract_id,
+                                display=cfg["display"],
+                                symbol=sym,
+                                stype=stype,
+                                stake=buy_price,
+                                payout=payout,
+                                entry_price=entry_price,
+                                ind=ind,
+                                balance=account_balance,
+                                currency=account_currency,
+                            )
+
+                            # 2. Iniciar monitoramento do resultado (WIN/LOSS) em paralelo
+                            asyncio.create_task(
+                                monitor_contract_outcome(
+                                    ws=ws,
+                                    contract_id=contract_id,
+                                    symbol=sym,
+                                    display=cfg["display"],
+                                    stype=stype,
+                                    stake=buy_price,
+                                    payout=payout,
+                                    entry_price=entry_price,
+                                    duration_min=5,
+                                )
                             )
 
                             try:
@@ -641,14 +863,18 @@ async def trading_loop(ws: DerivWS):
 
 
 # ---------------------------------------------------------------------------
-# Healthcheck HTTP server (para rodar de GRAÇA no Render Web Service)
+# Healthcheck HTTP server (porta para o Render e monitoramento público)
 # ---------------------------------------------------------------------------
 async def start_healthcheck_server():
-    """Servidor HTTP mínimo na porta 8080 para o Render manter o serviço ativo."""
+    """Servidor HTTP na porta configurada para o Render e pings externos."""
     from aiohttp import web
 
     async def handle_ping(request):
         pos_str = f"{len(open_positions)} abertas" if open_positions else "0 (aguardando gatilho)"
+        total = session_stats["total"]
+        wins = session_stats["wins"]
+        losses = session_stats["losses"]
+        winrate = (wins / total * 100.0) if total > 0 else 0.0
         return web.json_response({
             "status": "online",
             "bot": "Agente IA Cloud",
@@ -656,6 +882,13 @@ async def start_healthcheck_server():
             "account_type": active_account_type,
             "balance": f"${account_balance:.2f} {account_currency}",
             "positions": pos_str,
+            "stats": {
+                "total_trades": total,
+                "wins": wins,
+                "losses": losses,
+                "winrate": f"{winrate:.1f}%",
+                "net_profit": f"${session_stats['net_profit']:+.2f} {account_currency}",
+            },
             "utc_time": datetime.now(timezone.utc).isoformat(),
         })
 
