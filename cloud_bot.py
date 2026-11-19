@@ -582,10 +582,45 @@ async def trading_loop(ws: DerivWS):
 
 
 # ---------------------------------------------------------------------------
+# Healthcheck HTTP server (para rodar de GRAÇA no Render Web Service)
+# ---------------------------------------------------------------------------
+async def start_healthcheck_server():
+    """Servidor HTTP mínimo na porta 8080 para o Render não derrubar o serviço."""
+    from aiohttp import web
+
+    async def handle_ping(request):
+        pos_str = f"{len(open_positions)} abertas" if open_positions else "0 (aguardando gatilho)"
+        return web.json_response({
+            "status": "online",
+            "bot": "Agente IA Cloud",
+            "balance": f"${account_balance:.2f} {account_currency}",
+            "positions": pos_str,
+            "utc_time": datetime.now(timezone.utc).isoformat(),
+        })
+
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/healthz", handle_ping)
+    
+    port = int(os.getenv("PORT", "8080"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Healthcheck HTTP server rodando na porta {port}")
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint — Reconnect automático infinito
 # ---------------------------------------------------------------------------
 
 async def main():
+    # Iniciar servidor HTTP para o plano Free do Render
+    try:
+        await start_healthcheck_server()
+    except Exception as e:
+        log.warning(f"Não conseguiu subir healthcheck: {e}")
+
     reconnect_delay = 5
 
     while True:
@@ -624,3 +659,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
