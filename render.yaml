@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: agente-cloud
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DERIV_API_TOKEN
+        sync: false
+      - key: DERIV_APP_ID
+        value: "1089"
+      - key: DISCORD_WEBHOOK
+        sync: false
+    plan: free
