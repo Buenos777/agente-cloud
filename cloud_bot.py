@@ -11,6 +11,7 @@ Estratégia institucional original:
   - Cooldown: 30 minutos por ativo
   - Max posições simultâneas: 1 (em toda a cesta)
   - Notificações: Discord Rich Embeds com Entrada, Desfecho (WIN/LOSS), Placar e Saldo
+  - Alta Disponibilidade: Ping keepalive Deriv, reconexão automática e resolução resiliente
 """
 
 import asyncio
@@ -320,7 +321,7 @@ async def send_discord_outcome_alert(
             {"name": "Resultado", "value": result_badge, "inline": True},
             {"name": "Lucro / Prejuízo", "value": profit_badge, "inline": True},
             {"name": "Entrada ➔ Saída", "value": f"`{entry_price:.4f}` ➔ `{exit_price:.4f}`", "inline": True},
-            {"name": "🏆 Placar da Sessão", "value": f"**{wins} Wins — {losses} Losses**", "inline": True},
+            {"name": "🏆 Placar de Hoje", "value": f"**{wins} Wins — {losses} Losses**", "inline": True},
             {"name": "📊 Assertividade (Winrate)", "value": f"**{winrate:.1f}%**", "inline": True},
             {"name": "📈 Lucro Líquido Acumulado", "value": f"**${net_profit:+.2f} {currency}**", "inline": True},
             {"name": "💳 Saldo Atual da Banca", "value": f"🏦 **${balance:.2f} {currency}**", "inline": True},
@@ -420,22 +421,34 @@ def fetch_deriv_otp_url() -> tuple[str, str, str, float, str]:
 # ---------------------------------------------------------------------------
 
 class DerivWS:
-    """Wrapper para a conexão WebSocket autenticada via OTP da Deriv."""
+    """Wrapper resiliente para a conexão WebSocket autenticada via OTP da Deriv."""
 
     def __init__(self):
         self.ws = None
         self._req_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._recv_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
         self.account_id = ""
         self.account_type = ""
+
+    @property
+    def is_connected(self) -> bool:
+        if self.ws is None or self._recv_task is None:
+            return False
+        if self._recv_task.done():
+            return False
+        state = getattr(self.ws, "state", None)
+        if state is not None:
+            return state.name == "OPEN"
+        return not getattr(self.ws, "closed", True)
 
     def _next_id(self) -> int:
         self._req_id += 1
         return self._req_id
 
     async def connect(self):
-        """Obtém URL OTP da nova Deriv API e conecta."""
+        """Obtém URL OTP da nova Deriv API e conecta com heartbeat ativo."""
         import websockets
 
         log.info("Obtendo URL autenticada da Deriv via OTP REST API...")
@@ -447,8 +460,8 @@ class DerivWS:
         self.ws = await asyncio.wait_for(
             websockets.connect(
                 ws_url,
-                ping_interval=20,
-                ping_timeout=10,
+                ping_interval=30,
+                ping_timeout=20,
                 close_timeout=5,
                 max_size=2**22,
             ),
@@ -456,12 +469,36 @@ class DerivWS:
         )
         log.info(f"WebSocket conectado com sucesso! [Conta {acc_id}]")
         self._recv_task = asyncio.create_task(self._recv_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    async def _keepalive_loop(self):
+        """Envia ping da Deriv a cada 25 segundos para manter a sessão sempre viva."""
+        try:
+            while self.is_connected:
+                await asyncio.sleep(25)
+                if self.is_connected:
+                    try:
+                        await self.send({"ping": 1}, timeout=10)
+                    except Exception as e:
+                        log.warning(f"Keepalive Deriv ping falhou: {e}")
+                        break
+        except asyncio.CancelledError:
+            pass
 
     async def close(self):
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
         if self._recv_task:
             self._recv_task.cancel()
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("WebSocket fechado"))
+        self._pending.clear()
 
     async def _recv_loop(self):
         """Loop que recebe mensagens e resolve futures pendentes."""
@@ -474,22 +511,25 @@ class DerivWS:
                     if not fut.done():
                         fut.set_result(data)
         except Exception as e:
-            log.error(f"recv_loop encerrado: {e}")
+            log.warning(f"recv_loop encerrado: {e}")
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(ConnectionError(str(e)))
             self._pending.clear()
 
     async def send(self, payload: dict, timeout: float = 15) -> dict:
-        """Envia mensagem e aguarda resposta pelo req_id."""
+        """Envia mensagem e aguarda resposta pelo req_id com validação de conexão."""
+        if not self.is_connected:
+            raise ConnectionError("WebSocket Deriv desconectado")
+
         req_id = self._next_id()
         payload["req_id"] = req_id
         fut = asyncio.get_event_loop().create_future()
         self._pending[req_id] = fut
-        await self.ws.send(json.dumps(payload))
         try:
+            await self.ws.send(json.dumps(payload))
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except Exception:
             self._pending.pop(req_id, None)
             raise
 
@@ -556,7 +596,7 @@ class DerivWS:
 
     async def get_open_contracts(self) -> dict:
         """Consulta contratos atualmente abertos na carteira."""
-        return await self.send({"portfolio": 1})
+        return await self.send({"portfolio": 1}, timeout=15)
 
     async def get_contract_status(self, contract_id: int) -> dict:
         """Consulta detalhes e status de um contrato específico (aberto ou finalizado)."""
@@ -564,11 +604,76 @@ class DerivWS:
 
 
 # ---------------------------------------------------------------------------
+# Fallback Standalone para Consulta de Contratos & Sincronização
+# ---------------------------------------------------------------------------
+
+async def fetch_contract_status_standalone(contract_id: int) -> dict:
+    """Consulta o status de um contrato conectando diretamente à Deriv (à prova de falha do WS principal)."""
+    try:
+        def _get_otp_url():
+            headers = {
+                "Authorization": f"Bearer {API_TOKEN}",
+                "Deriv-App-ID": APP_ID,
+                "Content-Type": "application/json",
+            }
+            req = urllib.request.Request(
+                f"https://api.derivws.com/trading/v1/options/accounts/{active_account_id or 'DOT90318004'}/otp",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read().decode())["data"]["url"]
+
+        url = await asyncio.to_thread(_get_otp_url)
+        import websockets
+        async with websockets.connect(url, timeout=10) as tmp_ws:
+            await tmp_ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": contract_id, "req_id": 999}))
+            raw = await asyncio.wait_for(tmp_ws.recv(), timeout=10)
+            return json.loads(raw)
+    except Exception as e:
+        log.warning(f"fetch_contract_status_standalone falhou para #{contract_id}: {e}")
+        return {}
+
+
+async def sync_session_stats(ws: DerivWS):
+    """Sincroniza as estatísticas do dia atual diretamente com o histórico da Deriv."""
+    global session_stats
+    try:
+        today_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        resp = await ws.send({
+            "profit_table": 1,
+            "description": 1,
+            "date_from": today_start,
+            "limit": 50,
+        }, timeout=15)
+        txs = resp.get("profit_table", {}).get("transactions", [])
+        total_pnl = 0.0
+        w = 0
+        l = 0
+        for t in txs:
+            buy = float(t.get("buy_price", 0))
+            sell = float(t.get("sell_price", 0))
+            pnl = sell - buy
+            total_pnl += pnl
+            if pnl > 0:
+                w += 1
+            else:
+                l += 1
+        session_stats["total"] = len(txs)
+        session_stats["wins"] = w
+        session_stats["losses"] = l
+        session_stats["net_profit"] = total_pnl
+        log.info(f"Estatísticas de hoje sincronizadas com Deriv: {w}W - {l}L | PnL Líquido: ${total_pnl:+.2f}")
+    except Exception as e:
+        log.warning(f"Não conseguiu sincronizar profit_table da Deriv: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Monitoramento do Desfecho (WIN/LOSS) em Segundo Plano
 # ---------------------------------------------------------------------------
 
 async def monitor_contract_outcome(
-    ws: DerivWS,
     contract_id: int,
     symbol: str,
     display: str,
@@ -577,22 +682,32 @@ async def monitor_contract_outcome(
     payout: float,
     entry_price: float,
     duration_min: int = 5,
+    ws: DerivWS | None = None,
 ):
     """
     Acompanha o contrato até a expiração na Deriv.
     Assim que finaliza (status != 'open' ou is_expired == 1),
     calcula Win/Loss, estatísticas acumuladas e envia notificação rica no Discord.
+    Possui fallback automático para nunca abandonar a consulta em silêncio.
     """
     global session_stats, account_balance, account_currency
 
     log.info(f"Monitorando contrato #{contract_id} ({display} {stype}) - {duration_min}m...")
-    # Aguarda até perto do encerramento (ex: 260s para contrato de 300s) antes de consultar
-    wait_initial = max(5, (duration_min * 60) - 40)
+    wait_initial = max(5, (duration_min * 60) - 30)
     await asyncio.sleep(wait_initial)
 
-    for attempt in range(40):  # tenta por até ~3 minutos após o término previsto
+    for attempt in range(120):  # tenta por até 10 minutos após o término previsto
         try:
-            resp = await ws.get_contract_status(contract_id)
+            resp = {}
+            if ws and ws.is_connected:
+                try:
+                    resp = await ws.get_contract_status(contract_id)
+                except Exception:
+                    resp = {}
+
+            if not resp or "error" in resp or "proposal_open_contract" not in resp:
+                resp = await fetch_contract_status_standalone(contract_id)
+
             poc = resp.get("proposal_open_contract", {})
             status = poc.get("status", "open")
             is_expired = poc.get("is_expired", 0)
@@ -612,10 +727,11 @@ async def monitor_contract_outcome(
 
                 # Atualizar saldo da conta
                 try:
-                    bal_resp = await ws.get_balance()
-                    bal = bal_resp.get("balance", {})
-                    account_balance = float(bal.get("balance", account_balance))
-                    account_currency = bal.get("currency", account_currency)
+                    if ws and ws.is_connected:
+                        bal_resp = await ws.get_balance()
+                        bal = bal_resp.get("balance", {})
+                        account_balance = float(bal.get("balance", account_balance))
+                        account_currency = bal.get("currency", account_currency)
                 except Exception:
                     pass
 
@@ -644,9 +760,11 @@ async def monitor_contract_outcome(
                 return
 
         except Exception as e:
-            log.warning(f"Erro ao verificar contrato #{contract_id}: {e}")
+            log.warning(f"Erro ao verificar contrato #{contract_id} (tentativa {attempt}): {e}")
 
         await asyncio.sleep(5)
+
+    log.error(f"Tempo limite excedido ao monitorar contrato #{contract_id} após 120 tentativas!")
 
 
 # ---------------------------------------------------------------------------
@@ -677,11 +795,18 @@ async def trading_loop(ws: DerivWS):
     except Exception as e:
         log.warning(f"Erro ao ler saldo inicial: {e}")
 
+    # Sincronizar histórico do dia
+    await sync_session_stats(ws)
+
     last_heartbeat = 0
     cycle = 0
 
     while True:
         try:
+            # Validação instantânea de conectividade
+            if not ws.is_connected:
+                raise ConnectionError("Conexão com a Deriv foi interrompida")
+
             now_utc = datetime.now(timezone.utc)
 
             # ---- Trava de Sábado (weekday 5) ----
@@ -713,8 +838,11 @@ async def trading_loop(ws: DerivWS):
                     c for c in contracts
                     if (c.get("underlying_symbol") or c.get("symbol")) in BASKET
                 ]
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Erro ao consultar portfolio: {e}")
+                if not ws.is_connected:
+                    raise ConnectionError("WS desconectado durante get_open_contracts")
+                open_positions = []
 
             if len(open_positions) >= MAX_OPEN_POSITIONS:
                 await asyncio.sleep(4)
@@ -829,7 +957,6 @@ async def trading_loop(ws: DerivWS):
                             # 2. Iniciar monitoramento do resultado (WIN/LOSS) em paralelo
                             asyncio.create_task(
                                 monitor_contract_outcome(
-                                    ws=ws,
                                     contract_id=contract_id,
                                     symbol=sym,
                                     display=cfg["display"],
@@ -838,6 +965,7 @@ async def trading_loop(ws: DerivWS):
                                     payout=payout,
                                     entry_price=entry_price,
                                     duration_min=5,
+                                    ws=ws,
                                 )
                             )
 
@@ -857,8 +985,13 @@ async def trading_loop(ws: DerivWS):
             await asyncio.sleep(2)
             cycle += 1
 
+        except ConnectionError as e:
+            log.error(f"[CONEXÃO DERIV PERDIDA] {e}")
+            raise
         except Exception as e:
             log.error(f"[ERRO LOOP] {e}")
+            if not ws.is_connected:
+                raise ConnectionError("WS desconectado detectado após erro")
             await asyncio.sleep(5)
 
 
@@ -930,7 +1063,7 @@ async def main():
             log.error(f"[DESCONECTADO] {e}")
             log.info(f"Reconectando em {reconnect_delay}s...")
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 120)
+            reconnect_delay = min(reconnect_delay * 2, 60)
         finally:
             try:
                 await ws.close()
