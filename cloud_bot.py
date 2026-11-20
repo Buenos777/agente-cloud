@@ -151,7 +151,7 @@ async def trading_loop(ws):
         try:
             now = datetime.now(timezone.utc)
             if now.hour not in NOBRE_HOURS:
-                if now.minute % 30 == 0: log.info(f"Fora da Sessão Nobre ({now.hour}h UTC). Aguardando...")
+                if now.minute % 10 == 0: log.info(f"Robô Ativo (Aguardando Sessão Nobre - {now.hour}h UTC).")
                 await asyncio.sleep(60); continue
             
             port = await ws.send({"portfolio": 1})
