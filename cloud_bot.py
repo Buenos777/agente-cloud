@@ -184,7 +184,10 @@ async def trading_loop(ws):
                         await send_entry_alert(sym, sig, cfg["lot"], ind)
                         break
             await asyncio.sleep(10)
-        except Exception as e: log.error(f"Erro no Loop: {e}"); await asyncio.sleep(10)
+        except Exception as e: 
+            log.error(f"Erro no Loop: {e}. Reiniciando conexão...")
+            break # Sai do loop para a main() reconectar
+        await asyncio.sleep(10) # Pausa entre operações fora do loop de erro
 
 async def start_healthcheck():
     from aiohttp import web
@@ -205,6 +208,10 @@ async def main():
             log.error(f"Conexão falhou: {e}. Reconectando em 15s...")
             await asyncio.sleep(15)
         finally:
-            if ws.ws: await ws.ws.close()
+            if ws.ws:
+                try:
+                    await ws.ws.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__": asyncio.run(main())
