@@ -38,6 +38,7 @@ account_currency = "USD"
 active_account_id = ""
 active_account_type = ""
 last_trade_time = {sym: 0 for sym in BASKET}
+last_heartbeat = 0 # Adicionado para garantir o log de vida
 open_positions = []
 
 # --- INDICADORES ---
@@ -145,13 +146,15 @@ class DerivWS:
         return await self.send({"buy": p["proposal"]["id"], "price": p["proposal"]["ask_price"]})
 
 async def trading_loop(ws):
-    global last_trade_time
+    global last_trade_time, last_heartbeat
     log.info("Iniciando Trading Loop Híbrido Otimizado...")
     while True:
         try:
             now = datetime.now(timezone.utc)
             if now.hour not in NOBRE_HOURS:
-                if now.minute % 10 == 0: log.info(f"Robô Ativo (Aguardando Sessão Nobre - {now.hour}h UTC).")
+                if (time.time() - last_heartbeat) > 600:
+                    log.info(f"Robô Ativo (Aguardando Sessão Nobre - {now.hour}h UTC).")
+                    last_heartbeat = time.time()
                 await asyncio.sleep(60); continue
             
             port = await ws.send({"portfolio": 1})
