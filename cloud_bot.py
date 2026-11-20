@@ -21,7 +21,7 @@ log = logging.getLogger("cloud_bot")
 API_TOKEN = os.getenv("DERIV_API_TOKEN", "pat_f9c4151cc0d0206ee114bd367bdb56665b84b6a679c73c818c9403fb6813fece")
 APP_ID = os.getenv("DERIV_APP_ID", "34aYJ2dEbNZrIqKNOZPrY")
 ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1573074553406619678/YA6sVZuw1aCbGPQgA29Klx_Z-_HwqGyJ6OLpt63ZuvnqPQS8JeI0TA360ekzwx4trxQL")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 BASKET = {
     "R_50": {"display": "Volatility 50 Index", "lot": 0.5},
@@ -182,7 +182,6 @@ async def trading_loop(ws):
                         log.info(f"✅ ORDEM EXECUTADA: {sym} {sig}")
                         last_trade_time[sym] = time.time()
                         await send_entry_alert(sym, sig, cfg["lot"], ind)
-                        break
             await asyncio.sleep(10)
         except Exception as e: 
             log.error(f"Erro no Loop: {e}. Reiniciando conexão...")
