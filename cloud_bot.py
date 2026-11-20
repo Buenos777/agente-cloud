@@ -21,7 +21,7 @@ log = logging.getLogger("cloud_bot")
 API_TOKEN = os.getenv("DERIV_API_TOKEN", "pat_f9c4151cc0d0206ee114bd367bdb56665b84b6a679c73c818c9403fb6813fece")
 APP_ID = os.getenv("DERIV_APP_ID", "34aYJ2dEbNZrIqKNOZPrY")
 ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1573482390771335291/w42RelASpP2-g-PU8Laln7ZZ0yFf9m4rzsB14D3nYiOm6xvP9mGeFJ3FET2CCA-JDBfi")
 
 BASKET = {
     "R_50": {"display": "Volatility 50 Index", "lot": 0.5},
