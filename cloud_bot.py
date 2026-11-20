@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -205,27 +206,52 @@ def calculate_indicators(candles: list[dict]) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def send_discord_embed(embed: dict):
-    """Envia um Rich Embed para o Discord de forma assíncrona e segura."""
+    """Envia um Rich Embed para o Discord de forma assíncrona, com retry e proteção contra 429."""
     if not DISCORD_WEBHOOK:
         return
 
     payload = json.dumps({"embeds": [embed]}).encode("utf-8")
 
     def _post():
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 AgenteTraderCloud/1.0",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                pass
-        except Exception as e:
-            log.warning(f"Falha webhook Discord: {e}")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/Buenos777/agente-cloud, 1.0)",
+        }
+        for attempt in range(4):
+            req = urllib.request.Request(
+                DISCORD_WEBHOOK,
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    return
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    wait_time = 2.0
+                    try:
+                        raw = e.read().decode("utf-8", errors="ignore")
+                        data = json.loads(raw)
+                        wait_time = float(data.get("retry_after", 2.0))
+                    except Exception:
+                        retry_hdr = e.headers.get("Retry-After")
+                        if retry_hdr:
+                            try:
+                                wait_time = float(retry_hdr)
+                            except Exception:
+                                pass
+                    wait_time = max(0.5, min(wait_time, 10.0))
+                    log.warning(
+                        f"Discord 429 Rate Limit (tentativa {attempt + 1}/4). Aguardando {wait_time + 0.5:.2f}s..."
+                    )
+                    time.sleep(wait_time + 0.5)
+                else:
+                    log.warning(f"Falha webhook Discord HTTP {e.code}: {e.reason}")
+                    break
+            except Exception as e:
+                log.warning(f"Falha conexão webhook Discord (tentativa {attempt + 1}/4): {e}")
+                time.sleep(1.0)
 
     await asyncio.to_thread(_post)
 
@@ -715,17 +741,58 @@ async def monitor_contract_outcome(
             is_expired = poc.get("is_expired", 0)
 
             if is_expired == 1 or status in ("won", "lost"):
-                is_win = (status == "won")
-                profit = float(poc.get("profit", (payout - stake) if is_win else -stake))
-                exit_price = float(poc.get("exit_spot", entry_price))
-                profit_pct = float(poc.get("profit_percentage", 0.0))
+                # Se ainda estiver "open" com is_expired=1, aguarda 2s para Deriv consolidar status final
+                if status == "open" and is_expired == 1:
+                    await asyncio.sleep(2)
+                    try:
+                        if ws and ws.is_connected:
+                            fresh = await ws.get_contract_status(contract_id)
+                        else:
+                            fresh = await fetch_contract_status_standalone(contract_id)
+                        if fresh and "proposal_open_contract" in fresh:
+                            poc = fresh["proposal_open_contract"]
+                            status = poc.get("status", status)
+                    except Exception:
+                        pass
 
-                session_stats["total"] += 1
-                if is_win:
-                    session_stats["wins"] += 1
-                else:
-                    session_stats["losses"] += 1
-                session_stats["net_profit"] += profit
+                raw_profit = poc.get("profit")
+                profit = float(raw_profit) if raw_profit is not None else 0.0
+
+                # REGRA INFALÍVEL: lucro positivo OU status won = WIN
+                is_win = (status == "won") or (profit > 0.0)
+
+                # Se status ainda for indefinido e profit for 0, aguarda mais uma iteração
+                if not is_win and status not in ("won", "lost") and profit == 0.0:
+                    await asyncio.sleep(2)
+                    continue
+
+                if is_win and profit <= 0.0:
+                    profit = float(payout - stake)
+                elif not is_win and profit >= 0.0:
+                    profit = -float(stake)
+
+                exit_price = float(poc.get("exit_spot", poc.get("current_spot", entry_price)))
+                raw_pct = poc.get("profit_percentage")
+                profit_pct = float(raw_pct) if raw_pct is not None else ((profit / stake) * 100.0)
+
+                # Sincronizar histórico do dia diretamente com o extrato da Deriv
+                try:
+                    if ws and ws.is_connected:
+                        await sync_session_stats(ws)
+                    else:
+                        session_stats["total"] += 1
+                        if is_win:
+                            session_stats["wins"] += 1
+                        else:
+                            session_stats["losses"] += 1
+                        session_stats["net_profit"] += profit
+                except Exception:
+                    session_stats["total"] += 1
+                    if is_win:
+                        session_stats["wins"] += 1
+                    else:
+                        session_stats["losses"] += 1
+                    session_stats["net_profit"] += profit
 
                 # Atualizar saldo da conta
                 try:
