@@ -148,6 +148,7 @@ class DerivWS:
 async def trading_loop(ws):
     global last_trade_time, last_heartbeat
     log.info("Iniciando Trading Loop Híbrido Otimizado...")
+    active_contract = None
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -157,9 +158,20 @@ async def trading_loop(ws):
                     last_heartbeat = time.time()
                 await asyncio.sleep(60); continue
             
+            # --- MONITORAMENTO ---
             port = await ws.send({"portfolio": 1})
-            open_count = len(port.get("portfolio", {}).get("contracts", []))
-            if open_count >= 1: await asyncio.sleep(10); continue
+            contracts = port.get("portfolio", {}).get("contracts", [])
+            
+            if active_contract and not any(c["contract_id"] == active_contract["id"] for c in contracts):
+                # Ordem encerrada, buscar resultado
+                p_table = await ws.send({"profit_table": 1, "description": 1, "limit": 1})
+                tx = p_table.get("profit_table", {}).get("transactions", [{}])[0]
+                pnl = float(tx.get("pnl", 0))
+                log.info(f"🏁 ORDEM FINALIZADA: {active_contract['sym']} | RESULTADO: {'WIN' if pnl > 0 else 'LOSS'} | PnL: R$ {pnl:.2f}")
+                active_contract = None
+            
+            if len(contracts) >= 1: 
+                await asyncio.sleep(10); continue
 
             for sym, cfg in BASKET.items():
                 if (time.time() - last_trade_time[sym]) < COOLDOWN_SECONDS: continue
