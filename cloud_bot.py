@@ -637,14 +637,16 @@ async def fetch_contract_status_standalone(contract_id: int) -> dict:
 
 
 async def sync_session_stats(ws: DerivWS):
-    """Sincroniza as estatísticas do dia atual diretamente com o histórico da Deriv."""
+    """Sincroniza as estatísticas da sessão (últimas 24h) diretamente com a Deriv."""
     global session_stats
     try:
-        today_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        from datetime import timedelta
+        # Busca a partir das últimas 24h para contemplar a virada de dia UTC
+        start_date_str = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d")
         resp = await ws.send({
             "profit_table": 1,
             "description": 1,
-            "date_from": today_start,
+            "date_from": start_date_str,
             "limit": 50,
         }, timeout=15)
         txs = resp.get("profit_table", {}).get("transactions", [])
@@ -664,7 +666,7 @@ async def sync_session_stats(ws: DerivWS):
         session_stats["wins"] = w
         session_stats["losses"] = l
         session_stats["net_profit"] = total_pnl
-        log.info(f"Estatísticas de hoje sincronizadas com Deriv: {w}W - {l}L | PnL Líquido: ${total_pnl:+.2f}")
+        log.info(f"Estatísticas sincronizadas com Deriv: {w}W - {l}L | PnL Líquido: ${total_pnl:+.2f}")
     except Exception as e:
         log.warning(f"Não conseguiu sincronizar profit_table da Deriv: {e}")
 
