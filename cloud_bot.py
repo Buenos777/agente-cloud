@@ -72,11 +72,11 @@ BASKET: dict[str, dict] = {
 
 COOLDOWN_SECONDS: int = 6 * 300  # 30 minutos
 CANDLE_GRANULARITY: int = 300  # M5 = 300 segundos
-HISTORY_COUNT: int = 200  # candles necessários para indicadores (mais para M15 agrupado)
+HISTORY_COUNT: int = 300  # 300 candles M5 (permite EMA 200 + 100 barras M15 agrupadas)
 MAX_OPEN_POSITIONS: int = 1
 
-# Sessão Nobre: 21h-05h UTC (18h-02h BRT)
-NOBRE_HOURS: list[int] = [21, 22, 23, 0, 1, 2, 3, 4, 5]
+# Sessão Nobre: 21h-06h UTC (18h-03h BRT)
+NOBRE_HOURS: list[int] = [21, 22, 23, 0, 1, 2, 3, 4, 5, 6]
 
 # ---------------------------------------------------------------------------
 # Estado global & Estatísticas da Sessão
@@ -204,36 +204,38 @@ def calculate_indicators(candles: list[dict]) -> dict | None:
 def calculate_hybrid_indicators(candles_m5: list[dict]) -> dict | None:
     """
     Calcula indicadores da estratégia híbrida otimizada:
-    1. M15 trend: agrupa candles M5 em M15, calcula EMA 9/21/50 no M15
-    2. M5: EMA 9/21/50, RSI 14, ATR 14 (shifted 1)
+    1. M15 trend: agrupa candles M5 por janelas de 15m (epoch // 900), calcula EMA 9/21/50 no M15 (zero look-ahead)
+    2. M5: EMA 9/21/50/200, RSI 14, ATR 14 (shifted 1 na barra fechada)
     3. Wick rejection: lower_wick, upper_wick, body da barra fechada (penúltima)
 
-    Precisa de pelo menos 100 candles M5.
+    Precisa de pelo menos 220 candles M5 (HISTORY_COUNT=300 padrão).
     """
-    if len(candles_m5) < 100:
+    if len(candles_m5) < 220:
         return None
 
     # =====================================================================
-    # PARTE 1: M15 Trend (agrupamento de 3 candles M5 em 1 candle M15)
+    # PARTE 1: M15 Trend (agrupamento por epoch // 900 - barras fechadas)
     # =====================================================================
-    # Agrupa candles de 3 em 3, descartando os candles que sobram no início
-    num_m15 = len(candles_m5) // 3
-    if num_m15 < 30:
-        return None
+    by_bucket: dict[int, list[dict]] = {}
+    for c in candles_m5:
+        b = c["epoch"] // 900
+        if b not in by_bucket:
+            by_bucket[b] = []
+        by_bucket[b].append(c)
 
+    sorted_buckets = sorted(by_bucket.keys())
     m15_candles: list[dict] = []
-    start_idx = len(candles_m5) - (num_m15 * 3)
-    for i in range(start_idx, len(candles_m5), 3):
-        group = candles_m5[i : i + 3]
-        if len(group) < 3:
-            break
-        m15_candles.append({
-            "open": group[0]["open"],
-            "high": max(c["high"] for c in group),
-            "low": min(c["low"] for c in group),
-            "close": group[-1]["close"],
-            "epoch": group[-1]["epoch"],
-        })
+    # Iteramos até o penúltimo bucket para garantir apenas barras M15 100% fechadas
+    for b in sorted_buckets[:-1]:
+        group = by_bucket[b]
+        if len(group) == 3:
+            m15_candles.append({
+                "open": group[0]["open"],
+                "high": max(c["high"] for c in group),
+                "low": min(c["low"] for c in group),
+                "close": group[-1]["close"],
+                "epoch": b * 900,
+            })
 
     m15_closes = [c["close"] for c in m15_candles]
     if len(m15_closes) < 30:
@@ -255,7 +257,7 @@ def calculate_hybrid_indicators(candles_m5: list[dict]) -> dict | None:
         m15_trend = 0
 
     # =====================================================================
-    # PARTE 2: M5 — EMA 9/21/50, RSI 14, ATR 14 (shifted 1)
+    # PARTE 2: M5 — EMA 9/21/50/200, RSI 14, ATR 14 (shifted 1)
     # =====================================================================
     closes = [c["close"] for c in candles_m5]
     highs = [c["high"] for c in candles_m5]
@@ -282,14 +284,16 @@ def calculate_hybrid_indicators(candles_m5: list[dict]) -> dict | None:
         return None
     atr = atr_vals[-2]
 
-    # ---------- EMAs M5 (9, 21, 50) ----------
+    # ---------- EMAs M5 (9, 21, 50, 200) ----------
     ema9_all = ema(closes, 9)
     ema21_all = ema(closes, 21)
     ema50_all = ema(closes, 50)
+    ema200_all = ema(closes, 200)
 
     ema_9 = ema9_all[-2]
     ema_21 = ema21_all[-2]
     ema_50 = ema50_all[-2]
+    ema_200 = ema200_all[-2]
 
     # ---------- RSI 14 (ewm alpha=1/14, shifted 1) ----------
     deltas = [closes[i] - closes[i - 1] for i in range(1, n)]
@@ -336,6 +340,7 @@ def calculate_hybrid_indicators(candles_m5: list[dict]) -> dict | None:
         "ema_9": ema_9,
         "ema_21": ema_21,
         "ema_50": ema_50,
+        "ema_200": ema_200,
         # M5 Osciladores
         "rsi": rsi,
         "atr": atr,
@@ -439,19 +444,19 @@ async def send_discord_entry_alert(
         "fields": [
             {"name": "Ativo", "value": f"**{display}** (`{symbol}`)", "inline": True},
             {"name": "Direção", "value": direction_str, "inline": True},
-            {"name": "Duração", "value": "⏱️ **5 Minutos (M5)**", "inline": True},
+            {"name": "Duração", "value": "⏱️ **10 Minutos (2x M5)**", "inline": True},
             {"name": "Valor da Entrada (Stake)", "value": f"💵 **${stake:.2f} {currency}**", "inline": True},
             {"name": "Retorno Potencial (Payout)", "value": f"🎯 **${payout:.2f} {currency}**", "inline": True},
             {"name": "Preço de Entrada (Spot)", "value": f"📊 `{entry_price:.4f}`", "inline": True},
             {
                 "name": "🧠 Gatilho Técnico Híbrido (Pullback + Wick + M15)",
                 "value": (
-                    f"• M5: EMA 9 (`{ind.get('ema_9', 0):.2f}`) | EMA 21 (`{ind.get('ema_21', 0):.2f}`) | EMA 50 (`{ind.get('ema_50', 0):.2f}`)\n"
+                    f"• M5: EMA 9 (`{ind.get('ema_9', 0):.2f}`) | EMA 21 (`{ind.get('ema_21', 0):.2f}`) | EMA 50 (`{ind.get('ema_50', 0):.2f}`) | EMA 200 (`{ind.get('ema_200', 0):.2f}`)\n"
                     f"• M15 Trend: **{m15_label}** (EMA9 `{ind.get('m15_ema9', 0):.2f}` | EMA21 `{ind.get('m15_ema21', 0):.2f}` | EMA50 `{ind.get('m15_ema50', 0):.2f}`)\n"
                     f"• RSI (14): `{ind.get('rsi', 0):.1f}` (faixa 44–58 confirmada)\n"
                     f"• Volatilidade ATR: `{ind.get('atr', 0):.4f}`\n"
                     f"• {wick_ratio}\n"
-                    f"• Padrão: Pullback com Wick Rejection + confirmação MTF M15"
+                    f"• Padrão: Pullback com toque na EMA21 + Wick Rejection + MTF M15"
                 ),
                 "inline": False,
             },
@@ -754,7 +759,7 @@ class DerivWS:
         ]
 
     async def buy_contract(
-        self, symbol: str, contract_type: str, amount: float, duration: int = 5, duration_unit: str = "m"
+        self, symbol: str, contract_type: str, amount: float, duration: int = 10, duration_unit: str = "m"
     ) -> dict:
         """
         Executa compra na nova Deriv API:
@@ -870,7 +875,7 @@ async def monitor_contract_outcome(
     stake: float,
     payout: float,
     entry_price: float,
-    duration_min: int = 5,
+    duration_min: int = 10,
     ws: DerivWS | None = None,
 ):
     """
@@ -936,24 +941,13 @@ async def monitor_contract_outcome(
                 raw_pct = poc.get("profit_percentage")
                 profit_pct = float(raw_pct) if raw_pct is not None else ((profit / stake) * 100.0)
 
-                # Sincronizar histórico do dia diretamente com o extrato da Deriv
-                try:
-                    if ws and ws.is_connected:
-                        await sync_session_stats(ws)
-                    else:
-                        session_stats["total"] += 1
-                        if is_win:
-                            session_stats["wins"] += 1
-                        else:
-                            session_stats["losses"] += 1
-                        session_stats["net_profit"] += profit
-                except Exception:
-                    session_stats["total"] += 1
-                    if is_win:
-                        session_stats["wins"] += 1
-                    else:
-                        session_stats["losses"] += 1
-                    session_stats["net_profit"] += profit
+                # Atualizar estatísticas locais da sessão (isoladas a partir deste início)
+                session_stats["total"] += 1
+                if is_win:
+                    session_stats["wins"] += 1
+                else:
+                    session_stats["losses"] += 1
+                session_stats["net_profit"] += profit
 
                 # Atualizar saldo da conta
                 try:
@@ -1116,24 +1110,41 @@ async def trading_loop(ws: DerivWS):
                 stype: str | None = None
 
                 # ---- Setup Híbrido: CALL ----
-                # EMA9 > EMA21 > EMA50 (M5) + M15 trend bullish + close > EMA9
-                # + wick rejection (lower_wick / body >= 0.25) + RSI 44-58
+                # 1. EMAs M5 alinhadas em alta: EMA9 > EMA21 > EMA50
+                # 2. MTF M15 alinhado em alta: m15_trend == 1 (EMA9 > EMA21 > EMA50 no M15)
+                # 3. Pullback real: mínima testou ou perfurou a EMA21 (low_prev <= ema_21), fechando acima da EMA9
+                # 4. Vela verde (close_prev > open_prev) confirmando retomada compradora
+                # 5. Rejeição de pavio inferior (lower_wick / body >= 0.25)
+                # 6. RSI 14 em zona saudável (44 <= rsi <= 58)
+                # 7. Filtro Macro EMA200 e não-extensão: 0 < (close_prev - ema_200) / atr <= 5.0
+                dist_200: float = 0.0
                 if ind["ema_9"] > ind["ema_21"] > ind["ema_50"]:
                     if ind["m15_trend"] == 1:
-                        if ind["close_prev"] > ind["ema_9"]:
-                            if body > 0 and (ind["lower_wick"] / body) >= 0.25:
-                                if 44 <= ind["rsi"] <= 58:
-                                    stype = "CALL"
+                        if ind["low_prev"] <= ind["ema_21"] and ind["close_prev"] > ind["ema_9"]:
+                            if ind["close_prev"] > ind["open_prev"]:
+                                if body > 0 and (ind["lower_wick"] / body) >= 0.25:
+                                    if 44 <= ind["rsi"] <= 58:
+                                        dist_200 = (ind["close_prev"] - ind["ema_200"]) / atr
+                                        if 0 < dist_200 <= 5.0:
+                                            stype = "CALL"
 
                 # ---- Setup Híbrido: PUT ----
-                # EMA9 < EMA21 < EMA50 (M5) + M15 trend bearish + close < EMA9
-                # + wick rejection (upper_wick / body >= 0.25) + RSI 44-58
+                # 1. EMAs M5 alinhadas em baixa: EMA9 < EMA21 < EMA50
+                # 2. MTF M15 alinhado em baixa: m15_trend == -1 (EMA9 < EMA21 < EMA50 no M15)
+                # 3. Pullback real: máxima testou ou perfurou a EMA21 (high_prev >= ema_21), fechando abaixo da EMA9
+                # 4. Vela vermelha (close_prev < open_prev) confirmando retomada vendedora
+                # 5. Rejeição de pavio superior (upper_wick / body >= 0.25)
+                # 6. RSI 14 em zona saudável (44 <= rsi <= 58)
+                # 7. Filtro Macro EMA200 e não-extensão: 0 < (ema_200 - close_prev) / atr <= 5.0
                 elif ind["ema_9"] < ind["ema_21"] < ind["ema_50"]:
                     if ind["m15_trend"] == -1:
-                        if ind["close_prev"] < ind["ema_9"]:
-                            if body > 0 and (ind["upper_wick"] / body) >= 0.25:
-                                if 44 <= ind["rsi"] <= 58:
-                                    stype = "PUT"
+                        if ind["high_prev"] >= ind["ema_21"] and ind["close_prev"] < ind["ema_9"]:
+                            if ind["close_prev"] < ind["open_prev"]:
+                                if body > 0 and (ind["upper_wick"] / body) >= 0.25:
+                                    if 44 <= ind["rsi"] <= 58:
+                                        dist_200 = (ind["ema_200"] - ind["close_prev"]) / atr
+                                        if 0 < dist_200 <= 5.0:
+                                            stype = "PUT"
 
                 if stype is not None:
                     stake = cfg["lot"]
@@ -1148,7 +1159,7 @@ async def trading_loop(ws: DerivWS):
                     log.info(f"    TP dist: {tp_dist:.4f} | SL dist: {sl_dist:.4f}")
                     log.info(
                         f"    M5  EMA9={ind['ema_9']:.4f} EMA21={ind['ema_21']:.4f} "
-                        f"EMA50={ind['ema_50']:.4f} RSI={ind['rsi']:.1f}"
+                        f"EMA50={ind['ema_50']:.4f} EMA200={ind['ema_200']:.4f} RSI={ind['rsi']:.1f}"
                     )
                     log.info(
                         f"    M15 EMA9={ind['m15_ema9']:.4f} EMA21={ind['m15_ema21']:.4f} "
@@ -1163,13 +1174,16 @@ async def trading_loop(ws: DerivWS):
                             f"    Wick Ratio: lower/body={ind['lower_wick']/body:.2f} "
                             f"upper/body={ind['upper_wick']/body:.2f}"
                         )
+                    log.info(
+                        f"    Pullback EMA21: OK | Macro Dist EMA200: {dist_200:.2f} ATR | Duração: 10m"
+                    )
 
                     try:
                         result = await ws.buy_contract(
                             symbol=sym,
                             contract_type=stype,
                             amount=stake,
-                            duration=5,
+                            duration=10,
                             duration_unit="m",
                         )
 
@@ -1205,7 +1219,7 @@ async def trading_loop(ws: DerivWS):
                                 currency=account_currency,
                             )
 
-                            # 2. Iniciar monitoramento do resultado (WIN/LOSS) em paralelo
+                            # 2. Iniciar monitoramento do resultado (WIN/LOSS) em paralelo (10 min)
                             asyncio.create_task(
                                 monitor_contract_outcome(
                                     contract_id=contract_id,
@@ -1215,7 +1229,7 @@ async def trading_loop(ws: DerivWS):
                                     stake=buy_price,
                                     payout=payout,
                                     entry_price=entry_price,
-                                    duration_min=5,
+                                    duration_min=10,
                                     ws=ws,
                                 )
                             )
