@@ -74,6 +74,7 @@ COOLDOWN_SECONDS: int = 6 * 300  # 30 minutos
 CANDLE_GRANULARITY: int = 300  # M5 = 300 segundos
 HISTORY_COUNT: int = 300  # 300 candles M5 (permite EMA 200 + 100 barras M15 agrupadas)
 MAX_OPEN_POSITIONS: int = 1
+MAX_DIST_200: float = 6.0  # Limite de distanciamento da EMA 200 (em ATR) para evitar sobre-extensão
 
 # Sessão Nobre: 21h-06h UTC (18h-03h BRT)
 NOBRE_HOURS: list[int] = [21, 22, 23, 0, 1, 2, 3, 4, 5, 6]
@@ -1116,7 +1117,7 @@ async def trading_loop(ws: DerivWS):
                 # 4. Vela verde (close_prev > open_prev) confirmando retomada compradora
                 # 5. Rejeição de pavio inferior (lower_wick / body >= 0.25)
                 # 6. RSI 14 em zona saudável (44 <= rsi <= 58)
-                # 7. Filtro Macro EMA200 e não-extensão: 0 < (close_prev - ema_200) / atr <= 5.0
+                # 7. Filtro Macro EMA200 e não-extensão: 0 < (close_prev - ema_200) / atr <= MAX_DIST_200
                 dist_200: float = 0.0
                 if ind["ema_9"] > ind["ema_21"] > ind["ema_50"]:
                     if ind["m15_trend"] == 1:
@@ -1125,7 +1126,7 @@ async def trading_loop(ws: DerivWS):
                                 if body > 0 and (ind["lower_wick"] / body) >= 0.25:
                                     if 44 <= ind["rsi"] <= 58:
                                         dist_200 = (ind["close_prev"] - ind["ema_200"]) / atr
-                                        if 0 < dist_200 <= 5.0:
+                                        if 0 < dist_200 <= MAX_DIST_200:
                                             stype = "CALL"
 
                 # ---- Setup Híbrido: PUT ----
@@ -1135,7 +1136,7 @@ async def trading_loop(ws: DerivWS):
                 # 4. Vela vermelha (close_prev < open_prev) confirmando retomada vendedora
                 # 5. Rejeição de pavio superior (upper_wick / body >= 0.25)
                 # 6. RSI 14 em zona saudável (44 <= rsi <= 58)
-                # 7. Filtro Macro EMA200 e não-extensão: 0 < (ema_200 - close_prev) / atr <= 5.0
+                # 7. Filtro Macro EMA200 e não-extensão: 0 < (ema_200 - close_prev) / atr <= MAX_DIST_200
                 elif ind["ema_9"] < ind["ema_21"] < ind["ema_50"]:
                     if ind["m15_trend"] == -1:
                         if ind["high_prev"] >= ind["ema_21"] and ind["close_prev"] < ind["ema_9"]:
@@ -1143,7 +1144,7 @@ async def trading_loop(ws: DerivWS):
                                 if body > 0 and (ind["upper_wick"] / body) >= 0.25:
                                     if 44 <= ind["rsi"] <= 58:
                                         dist_200 = (ind["ema_200"] - ind["close_prev"]) / atr
-                                        if 0 < dist_200 <= 5.0:
+                                        if 0 < dist_200 <= MAX_DIST_200:
                                             stype = "PUT"
 
                 if stype is not None:
