@@ -1026,8 +1026,8 @@ async def trading_loop(ws: DerivWS):
     except Exception as e:
         log.warning(f"Erro ao ler saldo inicial: {e}")
 
-    # Sincronizar histórico do dia
-    await sync_session_stats(ws)
+    # Placar começa do zero a cada reinício (sem puxar histórico antigo)
+    log.info("Placar zerado. Contagem inicia do zero a partir de agora.")
 
     last_heartbeat: float = 0
     cycle: int = 0
